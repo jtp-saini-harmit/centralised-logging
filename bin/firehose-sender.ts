@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
-import { FirehoseSenderStack } from '../lib/firehose-sender-stack';
+import { FirehoseAndVPCStack } from '../lib/firehose-sender-stack';
 
 const app = new cdk.App();
-new FirehoseSenderStack(app, 'FirehoseSenderStack', {
+new FirehoseAndVPCStack(app, 'FirehoseAndVPCStack', {
   /* If you don't specify 'env', this stack will be environment-agnostic.
    * Account/Region-dependent features and context lookups will not work,
    * but a single synthesized template can be deployed anywhere. */
