@@ -31,7 +31,7 @@ export class FirehoseAndVPCStack extends cdk.Stack {
                     intervalInSeconds: 300,
                     sizeInMBs: 5,
                 },
-                compressionFormat: 'UNCOMPRESSED', // Logs are already compressed
+                compressionFormat: 'GZIP',
             },
         });
 
@@ -58,8 +58,7 @@ export class FirehoseAndVPCStack extends cdk.Stack {
 
         new logs.CfnSubscriptionFilter(this, 'LogGroupSubscription', {
             logGroupName: logGroup.logGroupName,
-            filterName: 'Destination',
-            filterPattern: '{$.userIdentity.type = Root}',
+            filterPattern: '',
             destinationArn: firehoseStream.attrArn,
             roleArn: cwlRole.roleArn,
         });
@@ -82,25 +81,6 @@ export class FirehoseAndVPCStack extends cdk.Stack {
         securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(22), 'Allow SSH access');
         securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP access');
 
-        // Create a role for VPC Flow Logs
-        const flowLogRole = new iam.Role(this, 'FlowLogRole', {
-            assumedBy: new iam.ServicePrincipal('vpc-flow-logs.amazonaws.com'),
-        });
-
-        // Grant CloudWatch Logs permissions to the Flow Log role
-        flowLogRole.addToPolicy(new iam.PolicyStatement({
-            actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
-            resources: [logGroup.logGroupArn],
-        }));
-
-        // Create VPC Flow Logs
-        new ec2.CfnFlowLog(this, 'MyVpcFlowLog', {
-            resourceId: vpc.vpcId,
-            resourceType: 'VPC',
-            trafficType: 'ALL',
-            logGroupName: logGroup.logGroupName,
-            deliverLogsPermissionArn: flowLogRole.roleArn,
-        });
 
         // Instance Role and SSM Managed Policy
         const instanceRole = new iam.Role(this, 'MyEc2Role', {
@@ -119,6 +99,17 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             resources: [logGroup.logGroupArn],
         }));
 
+        instanceRole.addToPolicy(new iam.PolicyStatement({
+            actions: [
+                's3:ListBucket',
+                's3:GetObject',
+            ],
+            resources: [
+                bucket.bucketArn,
+                `${bucket.bucketArn}/*`,
+            ],
+        }));
+
         // Instance
         const instance = new ec2.Instance(this, 'MyInstance', {
             instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.NANO),
@@ -129,21 +120,53 @@ export class FirehoseAndVPCStack extends cdk.Stack {
         });
 
         instance.addUserData(
-            'yum install -y amazon-cloudwatch-agent',
+            "sudo yum install -y amazon-cloudwatch-agent",
             `echo 'Logs will be sent to ${logGroup.logGroupName}'`,
-            '/opt/aws/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s'
-        );
-
-        // User data to set up a simple logging application
-        instance.addUserData(
-            "sudo yum update -y",
-            "sudo yum install -y httpd",
-            "sudo systemctl start httpd",
-            "sudo systemctl enable httpd",
-            "mkdir -p /var/www/html",
-            "cd /var/www/html",
-            "echo \"<h1>Hello World!</h1>\" > index.html",
-            "sudo systemctl restart httpd"
-        );
+            "sudo /opt/aws/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s"
+          );
+      
+          instance.addUserData(
+            "cat << 'EOF' > /opt/aws/amazon-cloudwatch-agent/bin/config.json",
+            "{",
+            "  \"logs\": {",
+            "    \"logs_collected\": {",
+            "      \"files\": {",
+            "        \"collect_list\": [",
+            "          {",
+            "            \"file_path\": \"/var/log/myapp.log\",",
+            `            "log_group_name": "${logGroup.logGroupName}",`,
+            "            \"log_stream_name\": \"{instance_id}\"",
+            "          }",
+            "        ]",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+            "EOF",
+            "sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json",
+          );
+      
+          // User data to set up Flask app
+          instance.addUserData(
+            "sudo yum install -y python3",
+            "sudo pip3 install flask",
+            "sudo mkdir -p /home/ec2-user/test",
+            "cd /home/ec2-user/test",
+            "echo \"import logging\" > app.py",
+            "echo \"from flask import Flask\" >> app.py",
+            "echo \"app = Flask(__name__)\" >> app.py",
+            "echo \"logging.basicConfig(filename='/var/log/myapp.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')\" >> app.py",
+            "echo \"@app.route('/')\" >> app.py",
+            "echo \"def hello():\" >> app.py",
+            "echo \"    app.logger.info('Hello endpoint was reached')\" >> app.py",
+            "echo \"    return 'Hello, This is source account!'\" >> app.py",
+            "echo \"@app.route('/error')\" >> app.py",
+            "echo \"def error():\" >> app.py",
+            "echo \"    app.logger.error('An error occurred!')\" >> app.py",
+            "echo \"    return 'This is an error route!', 500\" >> app.py",
+            "echo \"if __name__ == '__main__':\" >> app.py",
+            "echo \"    app.run(host='0.0.0.0', port=80, debug=True)\" >> app.py",
+            "sudo nohup python3 app.py &"
+          );
     }
 }
