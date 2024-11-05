@@ -5,9 +5,8 @@ import * as firehose from 'aws-cdk-lib/aws-kinesisfirehose';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as s3Notifications from 'aws-cdk-lib/aws-s3-notifications';
+import * as s3notifications from 'aws-cdk-lib/aws-s3-notifications';
 import { Construct } from 'constructs';
-import { Stack, StackProps } from 'aws-cdk-lib';
 
 export class FirehoseAndVPCStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -15,47 +14,63 @@ export class FirehoseAndVPCStack extends cdk.Stack {
 
         // Create an S3 bucket for Firehose
         const bucket = new s3.Bucket(this, 'CloudWatchLogsBucket', {
-            removalPolicy: cdk.RemovalPolicy.DESTROY, // Change to RETAIN in production
-            versioned: true,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
         });
 
-        // Add bucket policy for CloudWatch Logs
-        const bucketPolicy = new s3.BucketPolicy(this, 'CloudWatchLogsPolicy', {
-            bucket: bucket,
+        const lambdaRole = new iam.Role(this, 'LambdaExecutionRole', {
+            assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+            managedPolicies: [
+                iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+            ],
         });
 
-        bucketPolicy.document.addStatements(
-            new iam.PolicyStatement({
-                sid: 'AWSCloudWatchLogsBucketPermissions',
-                effect: iam.Effect.ALLOW,
-                principals: [
-                    new iam.ServicePrincipal('logs.amazonaws.com')
-                ],
-                actions: [
-                    's3:GetBucketAcl',
-                    's3:PutObjectAcl'
-                ],
-                resources: [
-                    `${bucket.bucketArn}/*`
-                ],
-                conditions: {
-                    'StringEquals': {
-                        'aws:SourceAccount': Stack.of(this).account
-                    }
-                }
-            })
-        );
+        // Create the Lambda function to rename log files
+        const renameLambda = new lambda.Function(this, 'RenameLogFilesFunction', {
+            runtime: lambda.Runtime.NODEJS_20_X,
+            handler: 'index.handler',
+            code: lambda.Code.fromAsset('lib/lambda'), // Path to the directory containing index.js
+            timeout: cdk.Duration.seconds(60),
+            role: lambdaRole,
+        });
 
+        lambdaRole.addToPolicy(new iam.PolicyStatement({
+            actions: [
+                's3:GetObject',
+                's3:PutObject',
+                's3:DeleteObject',
+            ],
+            resources: [
+                `${bucket.bucketArn}/*`, // Allow actions on all objects in the bucket
+            ],
+        }));
+        
+        bucket.grantReadWrite(renameLambda);
+        
+        // Add S3 notification to trigger Lambda function on object creation
+        bucket.addEventNotification(s3.EventType.OBJECT_CREATED, new s3notifications.LambdaDestination(renameLambda));
+        
         // Create IAM role for Firehose
         const firehoseRole = new iam.Role(this, 'FirehoseRole', {
             assumedBy: new iam.ServicePrincipal('firehose.amazonaws.com'),
         });
 
+        firehoseRole.addToPolicy(new iam.PolicyStatement({
+            actions: [
+                's3:GetObject',
+                's3:PutObject',
+                's3:DeleteObject',
+            ],
+            resources: [
+                `${bucket.bucketArn}/*`, // Allow actions on all objects in the bucket
+            ],
+        }));
+
         bucket.grantReadWrite(firehoseRole);
 
         // Create the Firehose delivery stream
         const firehoseStream = new firehose.CfnDeliveryStream(this, 'MyDeliveryStream', {
-            s3DestinationConfiguration: {
+
+            extendedS3DestinationConfiguration: {
                 bucketArn: bucket.bucketArn,
                 roleArn: firehoseRole.roleArn,
                 bufferingHints: {
@@ -63,7 +78,6 @@ export class FirehoseAndVPCStack extends cdk.Stack {
                     sizeInMBs: 5,
                 },
                 compressionFormat: 'GZIP',
-                prefix: 'vpcflowlogs/', // Prefix for the S3 objects
             },
         });
 
@@ -74,8 +88,8 @@ export class FirehoseAndVPCStack extends cdk.Stack {
                 CWLPolicy: new iam.PolicyDocument({
                     statements: [
                         new iam.PolicyStatement({
-                            actions: ['firehose:PutRecord'],
-                            resources: [firehoseStream.attrArn],
+                            actions: ['firehose:*'],
+                            resources: ['*'],
                         }),
                     ],
                 }),
@@ -94,6 +108,16 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             destinationArn: firehoseStream.attrArn,
             roleArn: cwlRole.roleArn,
         });
+
+        // Grant Lambda additional permissions
+        lambdaRole.addToPolicy(new iam.PolicyStatement({
+            actions: [
+                's3:GetObject',
+                's3:PutObject',
+                's3:DeleteObject',
+            ],
+            resources: [`${bucket.bucketArn}/*`], // Allow actions on all objects in the bucket
+        }));
 
         // VPC
         const vpc = new ec2.Vpc(this, 'MyVPC', {
@@ -130,7 +154,17 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             resources: [logGroup.logGroupArn],
         }));
 
-        
+        instanceRole.addToPolicy(new iam.PolicyStatement({
+            actions: [
+                's3:ListBucket',
+                's3:GetObject',
+            ],
+            resources: [
+                bucket.bucketArn,
+                `${bucket.bucketArn}/*`,
+            ],
+        }));
+
         // Instance
         const instance = new ec2.Instance(this, 'MyInstance', {
             instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.NANO),
@@ -144,9 +178,9 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             "sudo yum install -y amazon-cloudwatch-agent",
             `echo 'Logs will be sent to ${logGroup.logGroupName}'`,
             "sudo /opt/aws/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s"
-        );
-
-        instance.addUserData(
+          );
+      
+          instance.addUserData(
             "cat << 'EOF' > /opt/aws/amazon-cloudwatch-agent/bin/config.json",
             "{",
             "  \"logs\": {",
@@ -165,10 +199,10 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             "}",
             "EOF",
             "sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json",
-        );
-
-        // User data to set up Flask app
-        instance.addUserData(
+          );
+      
+          // User data to set up Flask app
+          instance.addUserData(
             "sudo yum install -y python3",
             "sudo pip3 install flask",
             "sudo mkdir -p /home/ec2-user/test",
@@ -188,48 +222,6 @@ export class FirehoseAndVPCStack extends cdk.Stack {
             "echo \"if __name__ == '__main__':\" >> app.py",
             "echo \"    app.run(host='0.0.0.0', port=80, debug=True)\" >> app.py",
             "sudo nohup python3 app.py &"
-        );
-
-        // Create the Lambda function to rename S3 files
-        const renameLambda = new lambda.Function(this, 'RenameS3FilesFunction', {
-            runtime: lambda.Runtime.NODEJS_18_X, // Use Node.js 18.x
-            handler: 'index.handler',
-            code: lambda.Code.fromAsset('lambda1'), // Path to your Lambda function code
-            environment: {
-                BUCKET_NAME: bucket.bucketName,
-            },
-            timeout: cdk.Duration.seconds(30),
-            memorySize: 256,
-        });
-
-        // // Add specific permissions for copying and deleting objects
-        // bucket.addToResourcePolicy(new iam.PolicyStatement({
-        //     actions: ['s3:CopyObject', 's3:DeleteObject'],
-        //     resources: [
-        //         `${bucket.bucketArn}/*`
-        //     ],
-        //     principals: [new iam.ServicePrincipal('lambda.amazonaws.com')]
-        // }));
-
-        // Update the bucket policy with correct S3 actions
-        bucket.addToResourcePolicy(new iam.PolicyStatement({
-            actions: [
-                's3:GetObject',
-                's3:PutObject',
-                's3:DeleteObject'
-            ],
-            resources: [
-                `${bucket.bucketArn}/*`
-            ],
-            principals: [new iam.ServicePrincipal('lambda.amazonaws.com')]
-        }));
-
-        // Grant the Lambda function permissions using the grant method
-        bucket.grantRead(renameLambda);
-        bucket.grantWrite(renameLambda);
-        bucket.grantWrite(firehoseRole);
-
-        // Set up S3 event notification to trigger the Lambda function
-        bucket.addEventNotification(s3.EventType.OBJECT_CREATED, new s3Notifications.LambdaDestination(renameLambda));
+          );
     }
 }
