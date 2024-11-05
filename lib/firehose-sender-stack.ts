@@ -14,7 +14,7 @@ export class FirehoseAndVPCStack extends cdk.Stack {
 
         // Create an S3 bucket for Firehose
         const bucket = new s3.Bucket(this, 'CloudWatchLogsBucket', {
-            removalPolicy: cdk.RemovalPolicy.DESTROY,
+            removalPolicy: cdk.RemovalPolicy.DESTROY, enforceSSL: true
         });
 
         const lambdaRole = new iam.Role(this, 'LambdaExecutionRole', {
