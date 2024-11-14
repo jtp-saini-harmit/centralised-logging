@@ -10,40 +10,58 @@ export class SourceAccountStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props?: cdk.StackProps) {
         super(scope, id, props);
 
-        // Target Account Firehose ARN (Replace with the actual ARN of the Firehose in the target account)
-        const firehoseStreamArn = 'arn:aws:firehose:ap-northeast-1:034362059217:deliverystream/TargetFirehoseStream';
-        const firehoseRoleArn = 'arn:aws:iam::034362059217:role/CloudWatchCrossAccountRole'; // From Account B
+        const vpc = new ec2.Vpc(this, 'Vpc', {
+          maxAzs: 2,
+          subnetConfiguration: [{
+              name: 'PublicSubnet',
+              subnetType: ec2.SubnetType.PUBLIC,
+          }],
+      });
 
+        // // Target Account Firehose ARN (Replace with the actual ARN of the Firehose in the target account)
+        // const firehoseStreamArn = 'arn:aws:firehose:ap-northeast-1:034362059217:deliverystream/TargetFirehoseStream';
 
-        // CloudWatch Logs subscription to trigger the Lambda function on new log events
-        new logs.CfnSubscriptionFilter(this, 'MyLogGroupSubscription', {
-          logGroupName: logGroup.logGroupName,
-          filterPattern: '',
-          destinationArn: firehoseStreamArn,
-          // roleArn: logForwardingLambda.role?.roleArn || '',  // Role to allow CloudWatch to invoke Lambda
-        });
-
-        const cloudWatchToFirehoseRole = new iam.Role(this, 'CloudWatchToFirehoseRole', {
-          assumedBy: new iam.ServicePrincipal('logs.amazonaws.com'),
+        const flowLogsRole = new iam.Role(this, 'PublishFlowLogs', {
+          assumedBy: new iam.ServicePrincipal('vpc-flow-logs.amazonaws.com'),
           inlinePolicies: {
-            CrossAccountFirehosePolicy: new iam.PolicyDocument({
+            PermissionsForVPCFlowLogs: new iam.PolicyDocument({
               statements: [
                 new iam.PolicyStatement({
-                  actions: ['sts:AssumeRole'],
-                  resources: ['arn:aws:iam::Account-B-ID:role/FirehoseWriteRole'], // Role in Account B
+                  actions: [
+                    'logs:CreateLogGroup',
+                    'logs:CreateLogStream',
+                    'logs:PutLogEvents',
+                    'logs:DescribeLogGroups',
+                    'logs:DescribeLogStreams',
+                  ],
+                  resources: ['*'], // VPC Flow Logs can access any log group/stream in the account
                 }),
               ],
             }),
           },
         });
 
-        // VPC Setup for EC2 instance
-        const vpc = new ec2.Vpc(this, 'Vpc', {
-            maxAzs: 2,
-            subnetConfiguration: [{
-                name: 'PublicSubnet',
-                subnetType: ec2.SubnetType.PUBLIC,
-            }],
+        const flowLogsLogGroup = new logs.LogGroup(this, 'VpcFlowLogsGroup', {
+          logGroupName: 'vpc-flow-logs',
+          removalPolicy: cdk.RemovalPolicy.DESTROY, // Only for dev, for prod use RETAIN
+        });
+
+        new ec2.CfnFlowLog(this, 'VpcFlowLog', {
+          resourceType: 'VPC',
+          resourceId: vpc.vpcId,
+          trafficType: 'ALL', // Capture all traffic (accepted, rejected, and all)
+          logGroupName: flowLogsLogGroup.logGroupName,
+          deliverLogsPermissionArn: flowLogsRole.roleArn,
+        });
+
+        const destinationArn = `arn:aws:logs:ap-northeast-1:034362059217:destination:MyDestination`
+    
+
+        new logs.CfnSubscriptionFilter(this, 'FlowLogSubscriptionFilter', {
+          logGroupName: flowLogsLogGroup.logGroupName,
+          filterName: 'AllTraffic',
+          filterPattern: '', // Empty pattern means all logs
+          destinationArn: destinationArn,
         });
 
         // Security Group for EC2 instance
@@ -64,7 +82,7 @@ export class SourceAccountStack extends cdk.Stack {
 
         instanceRole.addToPolicy(new iam.PolicyStatement({
             actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
-            resources: [logGroup.logGroupArn],
+            resources: [flowLogsLogGroup.logGroupArn],
         }));
 
         // EC2 instance setup
@@ -82,7 +100,7 @@ export class SourceAccountStack extends cdk.Stack {
         // EC2 instance user data to set up CloudWatch Agent and Flask app
         instance.addUserData(
             "sudo yum install -y amazon-cloudwatch-agent",
-            `echo 'Logs will be sent to ${logGroup.logGroupName}'`,
+            `echo 'Logs will be sent to ${flowLogsLogGroup.logGroupName}'`,
             "sudo /opt/aws/bin/amazon-cloudwatch-agent-ctl -a fetch-config -s"
         );
 
@@ -95,7 +113,7 @@ export class SourceAccountStack extends cdk.Stack {
             "        \"collect_list\": [",
             "          {",
             "            \"file_path\": \"/var/log/myapp.log\",",
-            `            "log_group_name": "${logGroup.logGroupName}",`,
+            `            "log_group_name": "${flowLogsLogGroup.logGroupName}",`,
             "            \"log_stream_name\": \"{instance_id}\"",
             "          }",
             "        ]",
