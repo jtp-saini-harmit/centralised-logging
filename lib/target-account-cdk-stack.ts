@@ -10,67 +10,205 @@ export class TargetAccountStack extends cdk.Stack {
     super(scope, id, props);
 
     // Create an S3 bucket in the target account to store logs
-    const bucket = new s3.Bucket(this, 'TargetLogsBucket', {
+    const bucket = new s3.Bucket(this, 'TargetLogBucket', {
       bucketName: "targetlogsbucket",
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       enforceSSL: true,
     });
 
-    // Create IAM role for Firehose to deliver logs to the S3 bucket
-    const firehoseRole = new iam.Role(this, 'FirehoseRole', {
-      assumedBy: new iam.ServicePrincipal('firehose.amazonaws.com'),
+    const firehoseTrustPolicy = new iam.PolicyDocument({
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ['sts:AssumeRole'],
+          principals: [new iam.ServicePrincipal('firehose.amazonaws.com')],
+          conditions: {
+            StringEquals: {
+              'sts:ExternalId': '034362059217', 
+            },
+          },
+        }),
+      ],
     });
 
-    firehoseRole.addToPolicy(new iam.PolicyStatement({
-        actions: [
-            's3:GetObject',
-            's3:PutObject',
-            's3:DeleteObject',
-        ],
-        resources: [
-            `${bucket.bucketArn}/*`, // Allow actions on all objects in the bucket
-        ],
-    }));
-
-    bucket.grantReadWrite(firehoseRole);
-
-    // Allow Account 1's CloudWatch Logs to assume this role
-    firehoseRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
-      actions: ['sts:AssumeRole'],
-      // principals: [new iam.AccountPrincipal('615299764212')], // Allow Account 1 to assume this role
-      conditions: {
-        'StringEquals': {
-          'sts:ExternalId': '615299764212', // Replace with your external ID
-        },
-      }
-    }));
-
-    bucket.grantReadWrite(firehoseRole);
-
-    // Create the Firehose delivery stream
-    new firehose.CfnDeliveryStream(this, 'TargetFirehoseStream', {
-      deliveryStreamType: 'DirectPut',
-      deliveryStreamName: 'TargetFirehoseStream',
-      extendedS3DestinationConfiguration: {
-        bucketArn: bucket.bucketArn,
-        roleArn: firehoseRole.roleArn,
-        bufferingHints: {
-          intervalInSeconds: 300,
-          sizeInMBs: 5,
-        },
-        compressionFormat: 'GZIP',
+    const firehoseRole = new iam.Role(this, 'FirehosetoS3Role', {
+      assumedBy: new iam.ServicePrincipal('firehose.amazonaws.com'),
+      inlinePolicies: {
+        PermissionsForFirehose: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                's3:AbortMultipartUpload',
+                's3:GetBucketLocation',
+                's3:GetObject',
+                's3:ListBucket',
+                's3:ListBucketMultipartUploads',
+                's3:PutObject',
+              ],
+              resources: [
+                bucket.bucketArn,
+                `${bucket.bucketArn}/*`, // All objects in the bucket
+              ],
+            }),
+          ],
+        }),
       },
     });
-    
-    // Create Firehose stream (already created above in Account B)
-    const firehoseStreamArn = 'arn:aws:firehose:region:034362059217:deliverystream/TargetFirehoseStream';
-    
-    // Create CloudWatch Logs destination for Firehose
-    new logs.CfnSubscriptionFilter(this, 'CloudWatchToFirehoseFilter', {
-      logGroupName: '/aws/lambda/my-log-group',
-      filterPattern: '',
-      destinationArn: firehoseStreamArn,
-      roleArn: 'arn:aws:iam::615299764212:role/CloudWatchLogsFirehoseRole', // Role in Account A allowing CloudWatch Logs to push data to Firehose
+
+    // const firehoseStream = new firehose.CfnDeliveryStream(this, 'MyDeliveryStream', {
+    //   deliveryStreamType: 'DirectPut',
+    //   s3DestinationConfiguration: {
+    //     roleArn: firehoseRole.roleArn,
+    //     bucketArn: bucket.bucketArn,
+    //     bufferingHints: {
+    //       intervalInSeconds: 300,
+    //       sizeInMBs: 5,
+    //     },
+    //     compressionFormat: 'GZIP',
+    //     cloudWatchLoggingOptions: {
+    //       enabled: false,
+    //     },
+    //     prefix: 'defaultTopic=!{partitionKeyFromQuery:defaultTopic}/!{timestamp:yyyy/MM/dd}/',
+    //     errorOutputPrefix: 'error/!{firehose:error-output-type}/',
+    //     dynamicPartitioningConfiguration: {
+    //         enabled: true,
+    //     },
+    //     processingConfiguration: {
+    //         enabled: true,
+    //         processors: [
+    //             {
+    //                 type: 'MetadataExtraction',
+    //                 parameters: [
+    //                 {
+    //                     parameterName: 'MetadataExtractionQuery',
+    //                     parameterValue: '{defaultTopic: .data.defaultTopic}',
+    //                 },
+    //                 {
+    //                     parameterName: 'JsonParsingEngine',
+    //                     parameterValue: 'JQ-1.6',
+    //                 },
+    //                 ],
+    //           },
+    //           {
+    //             type: 'AppendDelimiterToRecord',
+    //             parameters: [
+    //               {
+    //                 parameterName: 'Delimiter',
+    //                 parameterValue: '\\n',
+    //               },
+    //             ],
+    //           },
+    //         ]
+    //     }
+    //   }
+    // });
+
+    const firehoseStream = new firehose.CfnDeliveryStream(this, 'MyDeliveryStream', {
+        deliveryStreamType: 'DirectPut',
+        extendedS3DestinationConfiguration: {
+          roleArn: firehoseRole.roleArn,
+          bucketArn: bucket.bucketArn,
+          bufferingHints: {
+            intervalInSeconds: 300,
+            sizeInMBs: 64,
+          },
+          compressionFormat: 'GZIP',
+          cloudWatchLoggingOptions: {
+            enabled: false,
+          },
+          prefix: 'logGroup=!{partitionKeyFromQuery:logGroup}/!{timestamp:yyyy/MM/dd}/',
+          errorOutputPrefix: 'error/!{firehose:error-output-type}/',
+          dynamicPartitioningConfiguration: {
+            enabled: true,
+          },
+          processingConfiguration: {
+            enabled: true,
+            processors: [
+              {
+                type: 'MetadataExtraction',
+                parameters: [
+                  {
+                    parameterName: 'MetadataExtractionQuery',
+                    parameterValue: '{logGroup: .data.logGroup}',
+                  },
+                  {
+                    parameterName: 'JsonParsingEngine',
+                    parameterValue: 'JQ-1.6',
+                  },
+                ],
+              },
+              {
+                type: 'AppendDelimiterToRecord',
+                parameters: [
+                  {
+                    parameterName: 'Delimiter',
+                    parameterValue: '\\n',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+
+    const cloudWatchLogsTrustPolicy = new iam.PolicyDocument({
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ['sts:AssumeRole'],
+          principals: [new iam.ServicePrincipal('logs.ap-northeast-1.amazonaws.com')],
+          conditions: {
+            StringLike: {
+              'aws:SourceArn': [
+                `arn:aws:logs:ap-northeast-1:034362059217:*`,
+                `arn:aws:logs:ap-northeast-1:615299764212:*`,
+              ],
+            },
+          },
+        }),
+      ],
     });
+
+    const cloudWatchLogsRole = new iam.Role(this, 'CWLtoFirehoseRole', {
+      assumedBy: new iam.ServicePrincipal('logs.amazonaws.com'),
+      inlinePolicies: {
+        PermissionsForCWL: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['firehose:ListDeliveryStreams'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: [
+                'firehose:DescribeDeliveryStream',
+                'firehose:PutRecord',
+                'firehose:PutRecordBatch',
+              ],
+              resources: [firehoseStream.attrArn],
+            }),
+          ],
+        }),
+      },
+    });
+
+    const logDestination = new logs.CfnDestination(this, 'CloudWatchLogsDestination', {
+      destinationName: 'MyDestination',
+      targetArn: firehoseStream.attrArn,
+      roleArn: cloudWatchLogsRole.roleArn,
+      destinationPolicy: JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: {
+              AWS: '615299764212', // Replace with the AWS account ID allowed to send logs
+            },
+            Action: 'logs:PutSubscriptionFilter',
+            Resource: `arn:aws:logs:ap-northeast-1:034362059217:destination:MyDestination`,
+          },
+        ],
+      })
+    });    
   }
 }
+ 
